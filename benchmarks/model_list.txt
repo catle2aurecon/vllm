@@ -1,0 +1,2 @@
+teknium/OpenHermes-2-Mistral-7B .25 None
+TheBloke/LLaMA2-13B-Tiefighter-AWQ .3 awq
