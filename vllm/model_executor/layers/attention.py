@@ -10,9 +10,7 @@ from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
 from vllm import attention_ops
 from vllm import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
-from vllm.model_executor.layers.rotary_embedding import (
-    DynamicNTKScalingRotaryEmbedding, LinearScalingRotaryEmbedding,
-    RotaryEmbedding)
+from vllm.model_executor.layers.rotary_embedding import get_rope
 
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
@@ -20,7 +18,6 @@ _PARTITION_SIZE = 512
 
 
 class PagedAttention(nn.Module):
-    # pylint: disable=line-too-long
     """GPT-style multi-head PagedAttention.
 
     This class takes query, key, and value tensors as input. The input tensors
@@ -98,10 +95,15 @@ class PagedAttention(nn.Module):
         """
         if self.num_kv_heads != self.num_heads:
             # Project the key and value tensors to the desired number of heads.
-            key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=1)
-            value = torch.repeat_interleave(value,
-                                            self.num_queries_per_kv,
-                                            dim=1)
+            query = query.view(query.shape[0], self.num_kv_heads,
+                               self.num_queries_per_kv, query.shape[-1])
+            key = key[:, :,
+                      None, :].expand(key.shape[0], self.num_kv_heads,
+                                      self.num_queries_per_kv, key.shape[-1])
+            value = value[:, :,
+                          None, :].expand(value.shape[0], self.num_kv_heads,
+                                          self.num_queries_per_kv,
+                                          value.shape[-1])
 
         # TODO(woosuk): The unsqueeze op may incur some CPU overhead. Optimize.
         out = xops.memory_efficient_attention_forward(
@@ -113,7 +115,7 @@ class PagedAttention(nn.Module):
             scale=self.scale,
         )
         # TODO(woosuk): Unnecessary copy. Optimize.
-        output.copy_(out.squeeze(0))
+        output.copy_(out.view_as(output))
         return output
 
     def get_alibi_slopes(self) -> Optional[torch.Tensor]:
@@ -319,23 +321,8 @@ class PagedAttentionWithRoPE(PagedAttention):
                          scale,
                          num_kv_heads,
                          sliding_window=sliding_window)
-        if rope_scaling is None:
-            self.rotary_emb = RotaryEmbedding(head_size, rotary_dim,
-                                              max_position, base,
-                                              is_neox_style)
-        else:
-            scaling_type = rope_scaling["type"]
-            scaling_factor = rope_scaling["factor"]
-            if scaling_type == "linear":
-                self.rotary_emb = LinearScalingRotaryEmbedding(
-                    head_size, rotary_dim, max_position, base, is_neox_style,
-                    scaling_factor)
-            elif scaling_type == "dynamic":
-                self.rotary_emb = DynamicNTKScalingRotaryEmbedding(
-                    head_size, rotary_dim, max_position, base, is_neox_style,
-                    scaling_factor)
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        self.rotary_emb = get_rope(head_size, rotary_dim, max_position, base,
+                                   is_neox_style, rope_scaling)
 
     def forward(
         self,
@@ -445,10 +432,15 @@ class PagedAttentionWithALiBi(PagedAttention):
         """
         if self.num_kv_heads != self.num_heads:
             # Project the key and value tensors to the desired number of heads.
-            key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=1)
-            value = torch.repeat_interleave(value,
-                                            self.num_queries_per_kv,
-                                            dim=1)
+            query = query.view(query.shape[0], self.num_kv_heads,
+                               self.num_queries_per_kv, query.shape[-1])
+            key = key[:, :,
+                      None, :].expand(key.shape[0], self.num_kv_heads,
+                                      self.num_queries_per_kv, key.shape[-1])
+            value = value[:, :,
+                          None, :].expand(value.shape[0], self.num_kv_heads,
+                                          self.num_queries_per_kv,
+                                          value.shape[-1])
         batch_size = input_metadata.num_prompts
         seq_len = input_metadata.max_prompt_len
 
@@ -461,7 +453,7 @@ class PagedAttentionWithALiBi(PagedAttention):
             scale=self.scale,
         )
         # TODO(woosuk): Unnecessary copy. Optimize.
-        output.copy_(out.view(-1, self.num_heads, self.head_size))
+        output.copy_(out.view_as(output))
         return output
 
     def get_alibi_slopes(self) -> Optional[torch.Tensor]:
